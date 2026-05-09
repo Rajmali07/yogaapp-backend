@@ -17,6 +17,11 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Yoga Pose Correction API")
 
+# Keep Render requests smaller and faster.
+# Returning base64 images for every frame can create very large responses.
+MAX_FRAMES_TO_ANALYZE = int(os.environ.get("MAX_FRAMES_TO_ANALYZE", "12"))
+INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "").lower() == "true"
+
 # Enable CORS for frontend
 allowed_origins = [
     "http://localhost:3000",
@@ -147,6 +152,12 @@ async def analyze_pose(
         frames = video_processor.extract_frames(str(video_path), sample_rate=10)
         if not frames:
             raise HTTPException(400, "No frames could be extracted from the uploaded video")
+
+        # Cap the number of frames we send through the model and back to the client.
+        # This keeps hosted deployments from timing out or exhausting memory on large videos.
+        if len(frames) > MAX_FRAMES_TO_ANALYZE:
+            frames = frames[:MAX_FRAMES_TO_ANALYZE]
+
         logger.info(f"Extracted {len(frames)} frames")
         
         # Analyze each frame
@@ -154,18 +165,22 @@ async def analyze_pose(
         for idx, frame in enumerate(frames):
             prediction = model_handler.predict(frame)
             
-            # Convert frame to base64 for frontend display
-            _, buffer = cv2.imencode('.jpg', frame)
-            frame_base64 = base64.b64encode(buffer).decode('utf-8')
-            
-            results.append({
+            frame_result = {
                 "frame_number": idx,
                 "pose_detected": prediction["pose_class"],
                 "confidence": prediction["confidence"],
                 "is_correct": prediction["is_correct"],
                 "feedback": prediction["feedback"],
-                "image": f"data:image/jpeg;base64,{frame_base64}"
-            })
+            }
+
+            # Only include images when explicitly enabled. The Flutter UI can render
+            # the result cards without them, and leaving them out avoids huge responses.
+            if INCLUDE_FRAME_IMAGES:
+                _, buffer = cv2.imencode('.jpg', frame)
+                frame_base64 = base64.b64encode(buffer).decode('utf-8')
+                frame_result["image"] = f"data:image/jpeg;base64,{frame_base64}"
+
+            results.append(frame_result)
         
         # Calculate overall statistics
         if expected_pose:
