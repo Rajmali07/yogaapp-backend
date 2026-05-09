@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import shutil
 import os
+import asyncio
+import uuid
 from pathlib import Path
 import logging
 import base64
@@ -21,14 +23,32 @@ app = FastAPI(title="Yoga Pose Correction API")
 # Keep Render requests smaller and faster.
 # Returning base64 images for every frame can create very large responses.
 MAX_FRAMES_TO_ANALYZE = int(os.environ.get("MAX_FRAMES_TO_ANALYZE", "12"))
-INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "").lower() == "true"
+INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "true").lower() == "true"
 IS_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
 PRELOAD_MODEL = os.environ.get("PRELOAD_MODEL", "").lower() == "true" or IS_RENDER
 FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "20" if IS_RENDER else "10"))
+ASYNC_ANALYSIS = os.environ.get("ASYNC_ANALYSIS", "").lower() == "true" or IS_RENDER
+FRAME_IMAGE_MAX_WIDTH = int(os.environ.get("FRAME_IMAGE_MAX_WIDTH", "240" if IS_RENDER else "320"))
+FRAME_IMAGE_JPEG_QUALITY = int(os.environ.get("FRAME_IMAGE_JPEG_QUALITY", "45" if IS_RENDER else "70"))
 
 def _csv_env(name: str) -> List[str]:
     raw_value = os.environ.get(name, "")
     return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
+def _frame_to_data_url(frame) -> str:
+    """Convert a frame to a compressed JPEG data URL for UI previews."""
+    height, width = frame.shape[:2]
+    if width > FRAME_IMAGE_MAX_WIDTH:
+        scale = FRAME_IMAGE_MAX_WIDTH / float(width)
+        frame = cv2.resize(frame, (FRAME_IMAGE_MAX_WIDTH, int(height * scale)))
+
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), FRAME_IMAGE_JPEG_QUALITY]
+    ok, buffer = cv2.imencode(".jpg", frame, encode_params)
+    if not ok:
+        raise RuntimeError("Failed to encode frame preview")
+    frame_base64 = base64.b64encode(buffer).decode("utf-8")
+    return f"data:image/jpeg;base64,{frame_base64}"
 
 
 # Enable CORS for local development and hosted frontends.
@@ -103,6 +123,10 @@ model_handler = None
 UPLOAD_DIR = Path("temp_uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
+# In-memory job store for async analysis on Render.
+# This is enough for a single-instance deployment and keeps request/response times short.
+analysis_jobs = {}
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -146,6 +170,7 @@ async def analyze_pose(
     """
     global model_handler
     video_path = None
+    cleanup_in_finally = True
     
     try:
         # Load model on demand so the server can start quickly in local/dev runs.
@@ -168,68 +193,30 @@ async def analyze_pose(
         with open(video_path, "wb") as buffer:
             shutil.copyfileobj(video.file, buffer)
         
-        logger.info(f"Processing video: {video.filename}")
-        
-        # Extract frames from video
-        frames = video_processor.extract_frames(str(video_path), sample_rate=FRAME_SAMPLE_RATE)
-        if not frames:
-            raise HTTPException(400, "No frames could be extracted from the uploaded video")
-
-        # Cap the number of frames we send through the model and back to the client.
-        # This keeps hosted deployments from timing out or exhausting memory on large videos.
-        render_frame_limit = int(os.environ.get("MAX_FRAMES_TO_ANALYZE_RENDER", "6" if IS_RENDER else str(MAX_FRAMES_TO_ANALYZE)))
-        if len(frames) > render_frame_limit:
-            frames = frames[:render_frame_limit]
-
-        logger.info(f"Extracted {len(frames)} frames")
-        
-        # Analyze each frame
-        results = []
-        for idx, frame in enumerate(frames):
-            prediction = model_handler.predict(frame)
-            
-            frame_result = {
-                "frame_number": idx,
-                "pose_detected": prediction["pose_class"],
-                "confidence": prediction["confidence"],
-                "is_correct": prediction["is_correct"],
-                "feedback": prediction["feedback"],
+        if ASYNC_ANALYSIS:
+            job_id = str(uuid.uuid4())
+            analysis_jobs[job_id] = {
+                "status": "queued",
+                "message": "Analysis queued",
+                "video_name": video.filename,
             }
+            cleanup_in_finally = False
+            asyncio.create_task(_run_analysis_job(job_id, str(video_path), video.filename, expected_pose))
+            return JSONResponse(
+                status_code=202,
+                content={
+                    "status": "queued",
+                    "job_id": job_id,
+                    "message": "Analysis started in the background",
+                },
+            )
 
-            # Only include images when explicitly enabled. The Flutter UI can render
-            # the result cards without them, and leaving them out avoids huge responses.
-            if INCLUDE_FRAME_IMAGES:
-                _, buffer = cv2.imencode('.jpg', frame)
-                frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                frame_result["image"] = f"data:image/jpeg;base64,{frame_base64}"
-
-            results.append(frame_result)
-        
-        # Calculate overall statistics
-        if expected_pose:
-            # Check if detected pose matches expected pose
-            correct_count = sum(1 for r in results 
-                              if r["pose_detected"] == expected_pose and r["confidence"] > 0.7)
-        else:
-            correct_count = sum(1 for r in results if r["is_correct"])
-        
-        avg_confidence = sum(r["confidence"] for r in results) / len(results)
-        
-        overall_result = {
-            "video_name": video.filename,
-            "expected_pose": expected_pose,
-            "total_frames_analyzed": len(frames),
-            "correct_frames": correct_count,
-            "incorrect_frames": len(frames) - correct_count,
-            "accuracy_percentage": round((correct_count / len(frames)) * 100, 2),
-            "average_confidence": round(avg_confidence, 2),
-            "frame_results": results,
-            "overall_feedback": _generate_overall_feedback(results, expected_pose)
-        }
-        
-        # Cleanup
-        os.remove(video_path)
-        
+        overall_result = await asyncio.to_thread(
+            _analyze_video_file,
+            str(video_path),
+            video.filename,
+            expected_pose,
+        )
         return JSONResponse(content=overall_result)
     except HTTPException:
         raise
@@ -237,8 +224,98 @@ async def analyze_pose(
         logger.exception("Error processing video")
         raise HTTPException(500, f"Error processing video: {str(e)}")
     finally:
-        if video_path and video_path.exists():
+        if cleanup_in_finally and video_path and video_path.exists():
             os.remove(video_path)
+
+
+async def _run_analysis_job(job_id: str, video_path: str, video_name: str, expected_pose: str):
+    analysis_jobs[job_id] = {
+        "status": "processing",
+        "message": "Analysis in progress",
+        "video_name": video_name,
+    }
+
+    try:
+        result = await asyncio.to_thread(_analyze_video_file, video_path, video_name, expected_pose)
+        analysis_jobs[job_id] = {
+            "status": "completed",
+            "message": "Analysis complete",
+            "video_name": video_name,
+            "result": result,
+        }
+    except Exception as e:
+        logger.exception("Background analysis failed")
+        analysis_jobs[job_id] = {
+            "status": "failed",
+            "message": str(e),
+            "video_name": video_name,
+        }
+    finally:
+        if Path(video_path).exists():
+            os.remove(video_path)
+
+
+def _analyze_video_file(video_path: str, video_name: str, expected_pose: str):
+    global model_handler
+
+    logger.info("Processing video: %s", video_name)
+
+    # Extract frames from video
+    frames = video_processor.extract_frames(video_path, sample_rate=FRAME_SAMPLE_RATE)
+    if not frames:
+        raise HTTPException(400, "No frames could be extracted from the uploaded video")
+
+    # Cap the number of frames we send through the model and back to the client.
+    # This keeps hosted deployments from timing out or exhausting memory on large videos.
+    render_frame_limit = int(os.environ.get("MAX_FRAMES_TO_ANALYZE_RENDER", "6" if IS_RENDER else str(MAX_FRAMES_TO_ANALYZE)))
+    if len(frames) > render_frame_limit:
+        frames = frames[:render_frame_limit]
+
+    logger.info("Extracted %s frames", len(frames))
+
+    results = []
+    for idx, frame in enumerate(frames):
+        prediction = model_handler.predict(frame)
+
+        frame_result = {
+            "frame_number": idx,
+            "pose_detected": prediction["pose_class"],
+            "confidence": prediction["confidence"],
+            "is_correct": prediction["is_correct"],
+            "feedback": prediction["feedback"],
+        }
+
+        if INCLUDE_FRAME_IMAGES:
+            frame_result["image"] = _frame_to_data_url(frame)
+
+        results.append(frame_result)
+
+    if expected_pose:
+        correct_count = sum(1 for r in results if r["pose_detected"] == expected_pose and r["confidence"] > 0.7)
+    else:
+        correct_count = sum(1 for r in results if r["is_correct"])
+
+    avg_confidence = sum(r["confidence"] for r in results) / len(results)
+
+    return {
+        "video_name": video_name,
+        "expected_pose": expected_pose,
+        "total_frames_analyzed": len(frames),
+        "correct_frames": correct_count,
+        "incorrect_frames": len(frames) - correct_count,
+        "accuracy_percentage": round((correct_count / len(frames)) * 100, 2),
+        "average_confidence": round(avg_confidence, 2),
+        "frame_results": results,
+        "overall_feedback": _generate_overall_feedback(results, expected_pose),
+    }
+
+
+@app.get("/analysis-status/{job_id}")
+async def analysis_status(job_id: str):
+    job = analysis_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Analysis job not found")
+    return JSONResponse(content=job)
 
 
 @app.post("/analyze-webcam-frame")
