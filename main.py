@@ -22,6 +22,9 @@ app = FastAPI(title="Yoga Pose Correction API")
 # Returning base64 images for every frame can create very large responses.
 MAX_FRAMES_TO_ANALYZE = int(os.environ.get("MAX_FRAMES_TO_ANALYZE", "12"))
 INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "").lower() == "true"
+IS_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
+PRELOAD_MODEL = os.environ.get("PRELOAD_MODEL", "").lower() == "true" or IS_RENDER
+FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "20" if IS_RENDER else "10"))
 
 def _csv_env(name: str) -> List[str]:
     raw_value = os.environ.get(name, "")
@@ -114,7 +117,7 @@ async def startup_event():
         )
     model_handler = YogaModelHandler(SAVED_MODEL_PATH)
     logger.info("Model handler initialized")
-    if os.environ.get("PRELOAD_MODEL", "").lower() == "true":
+    if PRELOAD_MODEL:
         logger.info("Preloading TensorFlow model during startup...")
         model_handler.load_model()
         logger.info("TensorFlow model loaded successfully during startup")
@@ -168,14 +171,15 @@ async def analyze_pose(
         logger.info(f"Processing video: {video.filename}")
         
         # Extract frames from video
-        frames = video_processor.extract_frames(str(video_path), sample_rate=10)
+        frames = video_processor.extract_frames(str(video_path), sample_rate=FRAME_SAMPLE_RATE)
         if not frames:
             raise HTTPException(400, "No frames could be extracted from the uploaded video")
 
         # Cap the number of frames we send through the model and back to the client.
         # This keeps hosted deployments from timing out or exhausting memory on large videos.
-        if len(frames) > MAX_FRAMES_TO_ANALYZE:
-            frames = frames[:MAX_FRAMES_TO_ANALYZE]
+        render_frame_limit = int(os.environ.get("MAX_FRAMES_TO_ANALYZE_RENDER", "6" if IS_RENDER else str(MAX_FRAMES_TO_ANALYZE)))
+        if len(frames) > render_frame_limit:
+            frames = frames[:render_frame_limit]
 
         logger.info(f"Extracted {len(frames)} frames")
         
