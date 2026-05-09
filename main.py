@@ -25,7 +25,6 @@ app = FastAPI(title="Yoga Pose Correction API")
 MAX_FRAMES_TO_ANALYZE = int(os.environ.get("MAX_FRAMES_TO_ANALYZE", "12"))
 INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "true").lower() == "true"
 IS_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
-PRELOAD_MODEL = os.environ.get("PRELOAD_MODEL", "").lower() == "true" or IS_RENDER
 FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "20" if IS_RENDER else "10"))
 ASYNC_ANALYSIS = os.environ.get("ASYNC_ANALYSIS", "").lower() == "true" or IS_RENDER
 FRAME_IMAGE_MAX_WIDTH = int(os.environ.get("FRAME_IMAGE_MAX_WIDTH", "240" if IS_RENDER else "320"))
@@ -128,10 +127,25 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 analysis_jobs = {}
 
 
+def _get_model_handler() -> YogaModelHandler:
+    """Create and lazily load the TensorFlow model only when needed."""
+    global model_handler
+
+    if model_handler is None:
+        model_handler = YogaModelHandler(SAVED_MODEL_PATH)
+        logger.info("Model handler initialized")
+
+    if model_handler.model is None:
+        logger.info("Loading TensorFlow model lazily...")
+        model_handler.load_model()
+        logger.info("TensorFlow model loaded successfully")
+
+    return model_handler
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
-    global model_handler
     logger.info("Server starting up...")
     if not os.path.exists(SAVED_MODEL_PATH):
         logger.warning(
@@ -139,12 +153,6 @@ async def startup_event():
             "Set MODEL_PATH or add model_prep/yoga_savedmodel to this repo.",
             SAVED_MODEL_PATH,
         )
-    model_handler = YogaModelHandler(SAVED_MODEL_PATH)
-    logger.info("Model handler initialized")
-    if PRELOAD_MODEL:
-        logger.info("Preloading TensorFlow model during startup...")
-        model_handler.load_model()
-        logger.info("TensorFlow model loaded successfully during startup")
 
 
 @app.get("/")
@@ -168,16 +176,14 @@ async def analyze_pose(
     Returns:
         JSON with pose analysis results
     """
-    global model_handler
     video_path = None
     cleanup_in_finally = True
     
     try:
-        # Load model on demand so the server can start quickly in local/dev runs.
-        if model_handler.model is None:
-            logger.info("Loading TensorFlow model on demand...")
-            model_handler.load_model()
-            logger.info("Model loaded successfully!")
+        # In async/Render mode, do not block the request on model loading.
+        # The background job will load the model if needed.
+        if not ASYNC_ANALYSIS:
+            _get_model_handler()
 
         # Validate file type (check content type or file extension)
         valid_video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.webm']
@@ -256,9 +262,8 @@ async def _run_analysis_job(job_id: str, video_path: str, video_name: str, expec
 
 
 def _analyze_video_file(video_path: str, video_name: str, expected_pose: str):
-    global model_handler
-
     logger.info("Processing video: %s", video_name)
+    _get_model_handler()
 
     # Extract frames from video
     frames = video_processor.extract_frames(video_path, sample_rate=FRAME_SAMPLE_RATE)
@@ -329,14 +334,8 @@ async def analyze_webcam_frame(frame: UploadFile = File(...)):
     Returns:
         JSON with pose analysis result
     """
-    global model_handler
-    
     try:
-        # Load model on first request if not loaded
-        if model_handler.model is None:
-            logger.info("Loading TensorFlow model on first request...")
-            model_handler.load_model()
-            logger.info("Model loaded successfully!")
+        _get_model_handler()
         
         import cv2
         import numpy as np
