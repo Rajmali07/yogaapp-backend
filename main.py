@@ -25,10 +25,10 @@ app = FastAPI(title="Yoga Pose Correction API")
 MAX_FRAMES_TO_ANALYZE = int(os.environ.get("MAX_FRAMES_TO_ANALYZE", "12"))
 INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "true").lower() == "true"
 IS_RENDER = bool(os.environ.get("RENDER") or os.environ.get("RENDER_SERVICE_ID"))
-FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "20" if IS_RENDER else "10"))
+FRAME_SAMPLE_RATE = int(os.environ.get("FRAME_SAMPLE_RATE", "40" if IS_RENDER else "10"))
 ASYNC_ANALYSIS = os.environ.get("ASYNC_ANALYSIS", "").lower() == "true" or IS_RENDER
-FRAME_IMAGE_MAX_WIDTH = int(os.environ.get("FRAME_IMAGE_MAX_WIDTH", "240" if IS_RENDER else "320"))
-FRAME_IMAGE_JPEG_QUALITY = int(os.environ.get("FRAME_IMAGE_JPEG_QUALITY", "45" if IS_RENDER else "70"))
+FRAME_IMAGE_MAX_WIDTH = int(os.environ.get("FRAME_IMAGE_MAX_WIDTH", "160" if IS_RENDER else "320"))
+FRAME_IMAGE_JPEG_QUALITY = int(os.environ.get("FRAME_IMAGE_JPEG_QUALITY", "30" if IS_RENDER else "70"))
 
 def _csv_env(name: str) -> List[str]:
     raw_value = os.environ.get(name, "")
@@ -272,7 +272,7 @@ def _analyze_video_file(video_path: str, video_name: str, expected_pose: str):
 
     # Cap the number of frames we send through the model and back to the client.
     # This keeps hosted deployments from timing out or exhausting memory on large videos.
-    render_frame_limit = int(os.environ.get("MAX_FRAMES_TO_ANALYZE_RENDER", "6" if IS_RENDER else str(MAX_FRAMES_TO_ANALYZE)))
+    render_frame_limit = int(os.environ.get("MAX_FRAMES_TO_ANALYZE_RENDER", "3" if IS_RENDER else str(MAX_FRAMES_TO_ANALYZE)))
     if len(frames) > render_frame_limit:
         frames = frames[:render_frame_limit]
 
