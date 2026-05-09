@@ -1,0 +1,7 @@
+INFO:main:Resolved SavedModel path to C:\Users\user\Downloads\yoga_app_code (1)\yoga_app_code\backend\model_prep\yoga_savedmodel
+INFO:     Started server process [3804]
+INFO:     Waiting for application startup.
+INFO:main:Server starting up...
+INFO:main:Model handler initialized
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
