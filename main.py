@@ -7,6 +7,7 @@ from pathlib import Path
 import logging
 import base64
 import cv2
+from typing import List
 
 from model_handler import YogaModelHandler
 from video_processor import VideoProcessor
@@ -22,23 +23,41 @@ app = FastAPI(title="Yoga Pose Correction API")
 MAX_FRAMES_TO_ANALYZE = int(os.environ.get("MAX_FRAMES_TO_ANALYZE", "12"))
 INCLUDE_FRAME_IMAGES = os.environ.get("INCLUDE_FRAME_IMAGES", "").lower() == "true"
 
-# Enable CORS for frontend
+def _csv_env(name: str) -> List[str]:
+    raw_value = os.environ.get(name, "")
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
+
+
+# Enable CORS for local development and hosted frontends.
+# You can override this with ALLOWED_ORIGINS or FRONTEND_ORIGIN on Render.
 allowed_origins = [
     "http://localhost:3000",
     "http://localhost:4200",
     "http://localhost:5000",
     "http://localhost:8000",
+    "http://localhost:8091",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:4200",
+    "http://127.0.0.1:5000",
     "http://127.0.0.1:8000",
+    "http://127.0.0.1:8091",
 ]
+
+allowed_origins.extend(_csv_env("ALLOWED_ORIGINS"))
 
 frontend_origin = os.environ.get("FRONTEND_ORIGIN")
 if frontend_origin:
     allowed_origins.append(frontend_origin)
 
+allowed_origin_regex = os.environ.get(
+    "ALLOWED_ORIGIN_REGEX",
+    r"https://.*\.netlify\.app|https://.*\.onrender\.com|http://(localhost|127\.0\.0\.1)(:\d+)?",
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
-    allow_origin_regex=r"https://.*\.netlify\.app|http://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_origin_regex=allowed_origin_regex,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
